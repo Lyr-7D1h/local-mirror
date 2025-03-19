@@ -3,11 +3,14 @@
 // Fetch a website and save it locally
 //
 
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-extra");
 const fs = require("fs");
 const path = require("path");
 const minimist = require("minimist");
 const crypto = require("crypto");
+const cheerio = require("cheerio");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 
 // Parse command line arguments
 const argv = minimist(process.argv.slice(2));
@@ -16,11 +19,10 @@ if (typeof targetUrl !== "string") {
   console.error("Usage: download_page <url> [options]");
   process.exit(1);
 }
-const spanHosts = true;
 const outputDir =
   argv.output || path.join(process.cwd(), new URL(targetUrl).hostname);
 const maxDepth = argv.depth || 3;
-const waitTime = argv.wait || 2;
+const waitTime = argv.wait || 7;
 const randomWait = argv.randomWait !== false;
 const cookiesFile = argv.cookies || "cookies.txt";
 const userAgent =
@@ -69,7 +71,7 @@ function loadCookies() {
 
 // Delay function
 function delay(time) {
-  const actualTime = randomWait ? time * (0.5 + Math.random()) : time;
+  const actualTime = time * (0.5 + Math.random());
   console.log(`Delaying for ${actualTime} seconds`);
   return new Promise((resolve) => setTimeout(resolve, actualTime * 1000));
 }
@@ -151,123 +153,131 @@ async function crawlWebsite(browser, pageUrl, depth = 0) {
   visitedUrls.add(pageUrl);
   console.log(`Crawling [${depth}/${maxDepth}]: ${pageUrl}`);
 
-  try {
-    const page = await browser.newPage();
+  // Create a single page that reuses the same session
+  const page = await browser.newPage();
 
-    // Set user agent
-    await page.setUserAgent(userAgent);
+  await page.setUserAgent(userAgent);
 
-    // Enable request interception
-    await page.setRequestInterception(true);
+  const resourceMap = {};
 
-    const resourceMap = {};
+  // Enable request interception
+  await page.setRequestInterception(true);
+  page.on("request", async (request) => {
+    request.continue();
+  });
+  page.on("response", async (response) => {
+    const responseUrl = response.url();
 
-    page.on("request", async (request) => {
-      request.continue();
-    });
-
-    page.on("response", async (response) => {
-      const responseUrl = response.url();
-
-      if (downloadedResources.has(responseUrl)) {
-        return;
-      }
-
-      // Skip non-successful responses
-      if (!response.ok()) {
-        return;
-      }
-
-      try {
-        const contentType = response.headers()["content-type"] || "";
-
-        // Skip HTML documents (we'll save them separately)
-        if (contentType.includes("text/html")) {
-          return;
-        }
-
-        const buffer = await response.buffer().catch(() => null);
-        if (!buffer) return;
-
-        downloadedResources.add(responseUrl);
-        const localPath = await saveResource(responseUrl, buffer, contentType);
-        if (localPath) resourceMap[responseUrl] = localPath;
-      } catch (error) {
-        console.error(`Error downloading ${responseUrl}: ${error.message}`);
-      }
-    });
-
-    // Navigate to the page and wait for load
-    await page.goto(pageUrl, {
-      waitUntil: "networkidle0",
-      timeout: 60000,
-    });
-
-    // Wait for any dynamic content
-    await delay(2);
-
-    // Get the page content
-    let content = await page.content();
-
-    // Save the page
-    const filePath = urlToFilename(pageUrl);
-    content = convertLinks(content, pageUrl, resourceMap);
-    fs.writeFileSync(filePath, content);
-
-    const is_blocked = await page.evaluate(() => {
-      return (
-        document.querySelectorAll('meta[content="px-captcha"]').length > 0 ||
-        [...document.querySelectorAll("script")].filter((n) =>
-          n.src.startsWith("https://challenges.cloudflare.com/turnstile")
-        )
-      );
-    });
-
-    if (is_blocked) {
-      console.log(`Page is blocked: ${pageUrl}`);
+    if (downloadedResources.has(responseUrl)) {
       return;
     }
 
-    // Extract links for further crawling
-    const links = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll("a[href]"))
-        .map((a) => a.href)
-        .filter(
-          (href) =>
-            href && !href.startsWith("javascript:") && !href.startsWith("#")
-        );
-    });
-
-    // Wait between requests
-    await delay(waitTime);
-
-    // Recursively crawl linked pages
-    console.log(`Found ${links.length} links`);
-    const baseUrl = new URL(pageUrl);
-    for (const link of links) {
-      try {
-        const linkUrl = new URL(link);
-
-        // Apply no-parent rule - skip if link goes to parent directory
-        if (
-          linkUrl.hostname === baseUrl.hostname &&
-          !linkUrl.pathname.startsWith(baseUrl.pathname)
-        ) {
-          continue;
-        }
-
-        await crawlWebsite(browser, link, depth + 1);
-      } catch (error) {
-        // Skip invalid URLs
-      }
+    // Skip non-successful responses
+    if (!response.ok()) {
+      return;
     }
-  } catch (error) {
-    console.error(`Error crawling ${pageUrl}: ${error.message}`);
-    await browser.close();
+
+    try {
+      const contentType = response.headers()["content-type"] || "";
+
+      // Skip HTML documents (we'll save them separately)
+      if (contentType.includes("text/html")) {
+        return;
+      }
+
+      const buffer = await response.buffer().catch(() => null);
+      if (!buffer) return;
+
+      downloadedResources.add(responseUrl);
+      const localPath = await saveResource(responseUrl, buffer, contentType);
+      if (localPath) resourceMap[responseUrl] = localPath;
+    } catch (error) {
+      console.error(`Error downloading ${responseUrl}: ${error.message}`);
+    }
+  });
+
+  // Navigate to the page and wait for load
+  const response = await page.goto(pageUrl, {
+    waitUntil: "networkidle0",
+    timeout: 60000,
+  });
+
+  if (!response || !response.ok()) {
+    console.error(
+      `Failed to load page:  (HTTP ${response ? response.status() : "unknown"})`
+    );
+    await delay(10);
+    await crawlWebsite(browser, pageUrl, depth);
+    return;
+  }
+
+  // Wait for any dynamic content
+  await delay(1);
+
+  // Get the page content
+  let content = await page.content();
+
+  // Check if the page is blocked and extract links using cheerio
+  const $ = cheerio.load(content);
+
+  // Check if the page is blocked
+  const isBlocked =
+    $('meta[content="px-captcha"]').length > 0 ||
+    $('script[src^="https://challenges.cloudflare.com/turnstile"]').length > 0;
+
+  if (isBlocked) {
+    console.log(`Page is blocked: ${pageUrl}, trying again...`);
+    await delay(10);
+    await crawlWebsite(browser, pageUrl, depth);
+    return;
+  }
+
+  // Extract links for further crawling
+  const links = $("a[href]")
+    .map((_, a) => $(a).attr("href"))
+    .get()
+    .filter((href) => {
+      try {
+        new URL(href); // Fix: Use href instead of link
+        return href && !href.startsWith("javascript:") && !href.startsWith("#");
+      } catch (_) {
+        return false;
+      }
+    })
+    .sort(() => Math.random() - 0.5); // Randomize the order of links
+
+  // Save the page
+  const filePath = urlToFilename(pageUrl);
+  content = convertLinks(content, pageUrl, resourceMap);
+  fs.writeFileSync(filePath, content);
+
+  // Close the page but keep the browser open
+  await page.close();
+
+  // Recursively crawl linked pages
+  console.log(`Found ${links.length} links`);
+  const baseUrl = new URL(pageUrl);
+  for (const link of links) {
+    try {
+      linkUrl = new URL(link);
+
+      // Apply no-parent rule - skip if link goes to parent directory
+      if (
+        linkUrl.hostname === baseUrl.hostname &&
+        !linkUrl.pathname.startsWith(baseUrl.pathname)
+      ) {
+        continue;
+      }
+
+      // Wait between requests
+      await delay(waitTime);
+      await crawlWebsite(browser, link, depth + 1);
+    } catch (error) {
+      console.error(`Error crawling link ${link}: ${error.message}`);
+    }
   }
 }
 
-console.log(`Starting download of ${targetUrl} to ${outputDir}`);
 (async () => {
   const browser = await puppeteer.launch({
     headless: "new",
@@ -279,6 +289,7 @@ console.log(`Starting download of ${targetUrl} to ${outputDir}`);
     await browser.setCookie(...cookies);
   }
 
-  await crawlWebsite(browser, targetUrl).catch(console.error);
-  await browser.close();
+  console.log(`Starting download of ${targetUrl} to ${outputDir}`);
+  crawlWebsite(browser, targetUrl).catch(console.error);
+  // await browser.close();
 })();

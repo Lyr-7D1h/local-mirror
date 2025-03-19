@@ -5,8 +5,11 @@
     "local_mirror": "local_mirror"
   },
   "dependencies": {
+    "cheerio": "^1.0.0",
     "minimist": "^1.2.8",
-    "puppeteer": "^24.4.0"
+    "puppeteer": "^24.4.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "description": "Get a local version of a website using Puppeteer",
   "main": "index.js",
