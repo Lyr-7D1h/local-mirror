@@ -1,6 +1,6 @@
 {
   "name": "local-mirror",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "bin": {
     "local_mirror": "local_mirror"
   },
